@@ -1,0 +1,15 @@
+{
+  "features": [
+    "fixation_count",
+    "mean_fixation_duration_ms",
+    "total_fixation_duration_ms",
+    "time_to_first_fixation_ms",
+    "mean_saccade_amplitude_px",
+    "mean_saccade_velocity_px_s",
+    "scanpath_length_px",
+    "mean_pupil_diameter_px",
+    "pupil_diameter_variability_px",
+    "dwell_time_ms"
+  ],
+  "n_features": 10
+}
