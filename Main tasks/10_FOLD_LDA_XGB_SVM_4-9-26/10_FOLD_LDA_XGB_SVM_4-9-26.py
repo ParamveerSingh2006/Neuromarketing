@@ -12,7 +12,7 @@ Experimental design
     -> 5 modality configurations
     -> XGBoost/SVM: class weighting OFF and ON
     -> LDA: class weighting is intentionally NOT applied
-    -> Accuracy, F1, Cohen's Kappa
+    -> Accuracy, Precision, Recall, F1, Cohen's Kappa
 
 Total configurations:
     XGBoost: 5 x 2 = 10
@@ -74,7 +74,7 @@ import numpy as np
 import pandas as pd
 
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from sklearn.metrics import accuracy_score, cohen_kappa_score, f1_score
+from sklearn.metrics import accuracy_score, cohen_kappa_score, f1_score, precision_score, recall_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -844,6 +844,8 @@ def evaluate_subject(
         y_pred = np.concatenate(prediction_store[config.name]["y_pred"])
 
         accuracy = accuracy_score(y_true, y_pred)
+        precision = precision_score(y_true, y_pred, zero_division=0)
+        recall = recall_score(y_true, y_pred, zero_division=0)
         f1 = f1_score(y_true, y_pred, zero_division=0)
         kappa = cohen_kappa_score(y_true, y_pred)
 
@@ -857,6 +859,8 @@ def evaluate_subject(
                 "eeg_features": config.eeg_k,
                 "et_features": config.et_n,
                 "accuracy": float(accuracy),
+                "precision": float(precision),
+                "recall": float(recall),
                 "f1": float(f1),
                 "kappa": float(kappa),
                 "n_samples": int(len(y_true)),
@@ -1200,6 +1204,10 @@ def main() -> int:
                 subjects_evaluated=("subject", "nunique"),
                 mean_accuracy=("accuracy", "mean"),
                 std_accuracy=("accuracy", "std"),
+                mean_precision=("precision", "mean"),
+                std_precision=("precision", "std"),
+                mean_recall=("recall", "mean"),
+                std_recall=("recall", "std"),
                 mean_f1=("f1", "mean"),
                 std_f1=("f1", "std"),
                 mean_kappa=("kappa", "mean"),
