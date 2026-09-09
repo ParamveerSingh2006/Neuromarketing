@@ -1,0 +1,90 @@
+Folder PATH listing for volume Windows-SSD
+Volume serial number is 185E-EC00
+C:.
+¦   folder_structure.txt
+¦   NeuMa_PreProcessedDataset_Info.pdf
+¦   S01.mat
+¦   S02.mat
+¦   S03.mat
+¦   S05.mat
+¦   S06.mat
+¦   S07.mat
+¦   S08.mat
+¦   S09.mat
+¦   S10.mat
+¦   S12.mat
+¦   S13.mat
+¦   S14.mat
+¦   S15.mat
+¦   S16.mat
+¦   S17.mat
+¦   S18.mat
+¦   S19.mat
+¦   S20.mat
+¦   S21.mat
+¦   S22.mat
+¦   S23.mat
+¦   S24.mat
+¦   S25.mat
+¦   S26.mat
+¦   S27.mat
+¦   S28.mat
+¦   S29.mat
+¦   S30.mat
+¦   S31.mat
+¦   S32.mat
+¦   S33.mat
+¦   S34.mat
+¦   S35.mat
+¦   S36.mat
+¦   S37.mat
+¦   S38.mat
+¦   S39.mat
+¦   S40.mat
+¦   S41.mat
+¦   S42.mat
+¦   S43.mat
+¦   S44.mat
+¦   
++---Dependencies
+¦   +---Dependencies
+¦       +---BoundingBox_Coordinates
+¦       ¦       BoundingBoxPage_1.mat
+¦       ¦       BoundingBoxPage_2.mat
+¦       ¦       BoundingBoxPage_3.mat
+¦       ¦       BoundingBoxPage_4.mat
+¦       ¦       BoundingBoxPage_5.mat
+¦       ¦       BoundingBoxPage_6.mat
+¦       ¦       
+¦       +---Brochure_Pages
+¦               ImagePage_1.tif
+¦               ImagePage_2.tif
+¦               ImagePage_3.tif
+¦               ImagePage_4.tif
+¦               ImagePage_5.tif
+¦               ImagePage_6.tif
+¦               
++---NeuMa_PreProcessed_UsageCode
+    +---NeuroMkt_PreProcessedDataset
+        ¦   PreprocessedDataHandling.mlx
+        ¦   
+        +---Dependencies
+        ¦   +---BoundingBox_Coordinates
+        ¦   ¦       BoundingBoxPage_1.mat
+        ¦   ¦       BoundingBoxPage_2.mat
+        ¦   ¦       BoundingBoxPage_3.mat
+        ¦   ¦       BoundingBoxPage_4.mat
+        ¦   ¦       BoundingBoxPage_5.mat
+        ¦   ¦       BoundingBoxPage_6.mat
+        ¦   ¦       
+        ¦   +---Brochure_Pages
+        ¦           ImagePage_1.tif
+        ¦           ImagePage_2.tif
+        ¦           ImagePage_3.tif
+        ¦           ImagePage_4.tif
+        ¦           ImagePage_5.tif
+        ¦           ImagePage_6.tif
+        ¦           
+        +---PreProcessedData_Sample
+                S01.mat
+                
