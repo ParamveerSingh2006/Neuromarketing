@@ -1,837 +1,394 @@
 #!/usr/bin/env python3
 """
-Stage 2 — NeuMa signal processing and feature construction
-for Kalaganis et al. (2025), points 7–27.
+01_NeuMa_Preprocessing.py
 
-Consumes:
-    stage1_dataset.pkl
+Stage 1 — prepare the actual NeuMa subject .mat files for the paper pipeline.
 
-Produces:
-    stage2_features.pkl
-    stage2_features.csv
-    stage2_graphs.pkl
+The supplied subject files (verified on S13.mat and S19.mat) contain:
+  - EEG_clean.Data: 19 EEG channels, Fs=300 Hz
+  - ET_clean.Data: 6 ET channels, Fs=120 Hz
+  - Page1..Page6 / Product1..Product24
+  - ProductInfo.Bought
+  - EEG_segments / ET_segments
+  - EEG channel metadata in EEG_clean.chans
 
-Implemented:
-    EEG:
-      - 8–30 Hz zero-phase Butterworth filtering
-      - Hilbert-envelope functional connectivity
-      - absolute Pearson envelope correlation
-      - subject-specific weighted graph W
-      - unnormalised Laplacian L = D - W
-      - eigendecomposition
-      - Graph Fourier Transform X~ = U.T @ X
-      - mean graph-mode power
-      - mean aggregation across valid product segments
+The NeuMa dataset documentation states that EEG has already undergone:
+  0.5–45 Hz 3rd-order zero-phase Butterworth filtering, ASR and FORCe.
+ET blink-related missing samples have already been linearly interpolated.
 
-    ET:
-      - gaze trajectory / accumulated distance
-      - Hjorth Activity, Mobility, Complexity
-      - EyeMMV-style two-step fixation detection for:
-          fixation count
-          mean fixation duration
-          time to first fixation
-          dwell time
-      - blink rate is NOT inferred from interpolated ET data by default.
-        The paper specifies blink rate but the supplied preprocessed
-        dataset documentation does not expose a blink indicator. A
-        pupil-based blink detector would therefore be an additional
-        operationalization, not a faithful reproduction.
+Therefore this script DOES NOT repeat those operations.
 
-    Fusion:
-      - concatenate EEG and ET features at product level
-      - retain Buy/NoBuy labels
+It:
+  1. discovers S*.mat files;
+  2. loads the actual subject structures;
+  3. verifies the expected 19-channel EEG structure;
+  4. converts MATLAB inclusive [start,end] indices to Python [start-1:end];
+  5. discards segments shorter than 0.5 s;
+  6. preserves signal arrays, channel names and metadata;
+  7. writes one portable stage-1 pickle.
 
-IMPORTANT:
-    The paper does not explicitly disclose whether the functional graph
-    is reconstructed inside each CV fold or once per subject. Because
-    this stage precedes CV, this implementation uses a subject-level graph
-    built from all retained EEG segments. This is recorded in metadata and
-    MUST be revisited when implementing the leakage-controlled CV stage.
-
-    Likewise, exact normalization and the precise blink-rate implementation
-    are not specified sufficiently by the paper. This file does not silently
-    invent them.
-
-This file does NOT implement:
-    - normalization for the classifier
-    - Wilcoxon feature selection
-    - LOOCV
-    - SVM
-    - metrics
+No feature selection, normalization, graph construction, filtering, or ML
+takes place here.
 """
 
 from __future__ import annotations
 
 import argparse
 import pickle
+import re
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
-from scipy.signal import butter, filtfilt, hilbert
-
-
-DEFAULT_LOWER_HZ = 8.0
-DEFAULT_UPPER_HZ = 30.0
-DEFAULT_FILTER_ORDER = 3
-
-# EyeMMV reference operationalization.
-# The Kalaganis paper cites EyeMMV [43] for fixation identification but
-# does not state these parameters explicitly.
-DEFAULT_T1 = 0.250
-DEFAULT_T2 = 0.100
-DEFAULT_MIN_FIXATION_SECONDS = 0.150
-
-
-def load_pickle(path: Path):
-    with path.open("rb") as f:
-        return pickle.load(f)
-
-
-def save_pickle(path: Path, obj) -> None:
-    with path.open("wb") as f:
-        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-
-def bandpass_zero_phase(
-    x: np.ndarray,
-    fs: float,
-    low_hz: float,
-    high_hz: float,
-    order: int,
-) -> np.ndarray:
-    nyquist = fs / 2.0
-    if not (0 < low_hz < high_hz < nyquist):
-        raise ValueError(
-            f"Invalid band [{low_hz}, {high_hz}] Hz for Fs={fs} Hz."
-        )
-
-    b, a = butter(
-        order,
-        [low_hz / nyquist, high_hz / nyquist],
-        btype="bandpass",
-    )
-
-    # filtfilt can fail on extremely short segments. Such a segment should
-    # already have been screened by Stage 1, but we retain a defensive check.
-    padlen = 3 * max(len(a), len(b))
-    if x.shape[-1] <= padlen:
-        raise ValueError(
-            f"Segment has only {x.shape[-1]} samples; "
-            f"zero-phase filter requires more than padlen={padlen}."
-        )
-
-    return filtfilt(b, a, x, axis=-1)
-
-
-def envelope_connectivity(concatenated_eeg: np.ndarray) -> np.ndarray:
-    """
-    W[m,n] = |corr(HilbertEnvelope(x_m), HilbertEnvelope(x_n))|
-
-    Input:
-        [channels x samples]
-    Output:
-        [channels x channels]
-    """
-    analytic = hilbert(concatenated_eeg, axis=1)
-    envelopes = np.abs(analytic)
-
-    # np.corrcoef treats rows as variables.
-    W = np.corrcoef(envelopes)
-    W = np.abs(W)
-
-    W = np.nan_to_num(W, nan=0.0, posinf=0.0, neginf=0.0)
-    W = (W + W.T) / 2.0
-    np.fill_diagonal(W, 0.0)
-
-    return W
-
-
-def graph_fourier_basis(W: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    degree = np.sum(W, axis=1)
-    D = np.diag(degree)
-    L = D - W
-
-    eigenvalues, eigenvectors = np.linalg.eigh(L)
-
-    order = np.argsort(eigenvalues)
-    eigenvalues = eigenvalues[order]
-    eigenvectors = eigenvectors[:, order]
-
-    return eigenvalues, eigenvectors
-
-
-def gft_power(
-    eeg_segment: np.ndarray,
-    eigenvectors: np.ndarray,
-) -> np.ndarray:
-    """
-    X~ = U.T X
-    p(m) = mean_t |X~(m,t)|^2
-    """
-    transformed = eigenvectors.T @ eeg_segment
-    power = np.mean(np.abs(transformed) ** 2, axis=1)
-    return np.asarray(power, dtype=np.float64)
-
-
-def aggregate_segment_features(
-    segment_features: List[np.ndarray],
-) -> np.ndarray:
-    if not segment_features:
-        raise ValueError("Cannot aggregate an empty feature list.")
-    return np.mean(np.vstack(segment_features), axis=0)
-
-
-def gaze_xy_from_et(
-    et_segment: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    NeuMa ET_clean.Data rows:
-      0 = left X
-      1 = left Y
-      2 = left pupil
-      3 = right X
-      4 = right Y
-      5 = right pupil
-
-    Coordinates are normalized to [0,1].
-    We average left/right gaze coordinates where both are finite.
-    If only one eye is finite, that eye is used.
-    """
-    if et_segment.shape[0] < 5:
-        raise ValueError(
-            f"Expected at least 5 ET rows, got {et_segment.shape[0]}"
-        )
-
-    lx, ly = et_segment[0], et_segment[1]
-    rx, ry = et_segment[3], et_segment[4]
-
-    valid_l = np.isfinite(lx) & np.isfinite(ly)
-    valid_r = np.isfinite(rx) & np.isfinite(ry)
-
-    x = np.full(lx.shape, np.nan, dtype=float)
-    y = np.full(ly.shape, np.nan, dtype=float)
-
-    both = valid_l & valid_r
-    only_l = valid_l & ~valid_r
-    only_r = ~valid_l & valid_r
-
-    x[both] = (lx[both] + rx[both]) / 2.0
-    y[both] = (ly[both] + ry[both]) / 2.0
-
-    x[only_l] = lx[only_l]
-    y[only_l] = ly[only_l]
-
-    x[only_r] = rx[only_r]
-    y[only_r] = ry[only_r]
-
-    return x, y
-
-
-def interpolate_internal_nans(
-    x: np.ndarray,
-    y: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Defensive interpolation for any residual NaNs.
-
-    The NeuMa preprocessed dataset states that missing ET values caused by
-    spontaneous blinking were linearly interpolated already. This function
-    only handles residual NaNs if present in the supplied file.
-    """
-    idx = np.arange(len(x))
-    valid = np.isfinite(x) & np.isfinite(y)
-
-    if valid.sum() < 2:
-        raise ValueError(
-            "Insufficient valid gaze samples after preprocessing."
-        )
-
-    x_out = np.interp(idx, idx[valid], x[valid])
-    y_out = np.interp(idx, idx[valid], y[valid])
-
-    return x_out, y_out
-
-
-def accumulated_distance(
-    x: np.ndarray,
-    y: np.ndarray,
-) -> np.ndarray:
-    dx = np.diff(x, prepend=x[0])
-    dy = np.diff(y, prepend=y[0])
-    distance = np.sqrt(dx * dx + dy * dy)
-    return distance
-
-
-def hjorth_features(x: np.ndarray) -> np.ndarray:
-    """
-    Hjorth:
-      Activity   = var(x)
-      Mobility   = sqrt(var(dx) / var(x))
-      Complexity = Mobility(dx) / Mobility(x)
-    """
-    x = np.asarray(x, dtype=float)
-
-    activity = float(np.var(x))
-
-    if activity <= np.finfo(float).eps:
-        return np.array([activity, 0.0, 0.0], dtype=float)
-
-    dx = np.diff(x)
-
-    if len(dx) < 2:
-        return np.array([activity, np.nan, np.nan], dtype=float)
-
-    dx_var = float(np.var(dx))
-    mobility = np.sqrt(dx_var / activity) if dx_var > 0 else 0.0
-
-    ddx = np.diff(dx)
-
-    if len(ddx) < 2 or mobility <= np.finfo(float).eps:
-        complexity = 0.0
-    else:
-        ddx_var = float(np.var(ddx))
-        mobility_dx = np.sqrt(ddx_var / dx_var) if dx_var > 0 else 0.0
-        complexity = mobility_dx / mobility
-
-    return np.array(
-        [activity, mobility, complexity],
-        dtype=float,
-    )
-
-
-def euclidean_distance(
-    x1: float,
-    y1: float,
-    x2: float,
-    y2: float,
-) -> float:
-    return float(np.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2))
-
-
-def detect_fixations_eyemmv_style(
-    x: np.ndarray,
-    y: np.ndarray,
-    fs: float,
-    t1: float,
-    t2: float,
-    min_duration_seconds: float,
-) -> List[Dict[str, float]]:
-    """
-    Python implementation of the two-stage spatial-dispersion concept
-    described by EyeMMV.
-
-    Stage 1:
-      build a cluster while samples remain within t1 of the current mean.
-
-    Stage 2:
-      remove samples farther than t2 from the cluster mean and recompute
-      the fixation center/duration.
-
-    This is an operationalization based on the cited EyeMMV method.
-    The Kalaganis paper does not explicitly publish these parameter values.
-    """
-    valid = np.isfinite(x) & np.isfinite(y)
-    if valid.sum() < 2:
-        return []
-
-    x = x[valid]
-    y = y[valid]
-
-    fixations: List[Dict[str, float]] = []
-    n = len(x)
-    i = 0
-
-    while i < n:
-        start = i
-        mean_x = x[i]
-        mean_y = y[i]
-        i += 1
-
-        while i < n:
-            d = euclidean_distance(x[i], y[i], mean_x, mean_y)
-            if d > t1:
-                break
-
-            cluster_x = x[start:i + 1]
-            cluster_y = y[start:i + 1]
-            mean_x = float(np.mean(cluster_x))
-            mean_y = float(np.mean(cluster_y))
-            i += 1
-
-        end = i
-        cluster_x = x[start:end]
-        cluster_y = y[start:end]
-
-        if len(cluster_x) < 2:
-            continue
-
-        center_x = float(np.mean(cluster_x))
-        center_y = float(np.mean(cluster_y))
-
-        distances = np.sqrt(
-            (cluster_x - center_x) ** 2
-            + (cluster_y - center_y) ** 2
-        )
-
-        keep = distances <= t2
-
-        if keep.sum() < 2:
-            continue
-
-        kept_x = cluster_x[keep]
-        kept_y = cluster_y[keep]
-
-        duration = len(kept_x) / fs
-
-        if duration < min_duration_seconds:
-            continue
-
-        # `start` is the onset of the first-stage fixation cluster.
-        # Retain it so time-to-first-fixation can be calculated relative
-        # to the beginning of the product epoch.
-        fixations.append({
-            "center_x": float(np.mean(kept_x)),
-            "center_y": float(np.mean(kept_y)),
-            "duration_seconds": float(duration),
-            "start_sample": int(start),
-        })
-
-    return fixations
-
-
-def et_marketing_features(
-    et_segment: np.ndarray,
-    fs: float,
-    t1: float,
-    t2: float,
-    min_fixation_seconds: float,
-) -> np.ndarray:
-    """
-    Returns four source-supported/operationalized features:
-      1. fixation count
-      2. mean fixation duration
-      3. time to first fixation
-      4. dwell time
-
-    Blink rate is intentionally not inferred here because the supplied
-    preprocessed ET representation contains interpolated gaze/pupil signals
-    but no explicit blink event channel.
-    """
-    x, y = gaze_xy_from_et(et_segment)
-    x, y = interpolate_internal_nans(x, y)
-
-    fixations = detect_fixations_eyemmv_style(
-        x=x,
-        y=y,
-        fs=fs,
-        t1=t1,
-        t2=t2,
-        min_duration_seconds=min_fixation_seconds,
-    )
-
-    if not fixations:
-        return np.array([0.0, 0.0, np.nan, 0.0], dtype=float)
-
-    durations = np.array(
-        [f["duration_seconds"] for f in fixations],
-        dtype=float,
-    )
-
-    first_fixation_start = fixations[0]["start_sample"]
-    time_to_first_fixation = first_fixation_start / fs
-
-    return np.array(
-        [
-            float(len(fixations)),
-            float(np.mean(durations)),
-            float(time_to_first_fixation),
-            float(np.sum(durations)),
-        ],
-        dtype=float,
-    )
-
-
-def process_subject(
-    subject: Dict,
-    lower_hz: float,
-    upper_hz: float,
-    filter_order: int,
-    t1: float,
-    t2: float,
-    min_fixation_seconds: float,
-) -> Dict:
-
-    subject_id = subject["subject_id"]
-    eeg_fs = float(subject["sampling_rates"]["eeg_hz"])
-    et_fs = float(subject["sampling_rates"]["et_hz"])
-
-    products = subject["products"]
-
-    # ---------------------------------------------------------------
-    # EEG graph construction
-    # ---------------------------------------------------------------
-    filtered_segments = []
-
-    for product in products:
-        for record in product["eeg_segments"]:
-            eeg = record["data"]
-            if eeg is None:
-                continue
-
-            eeg = np.asarray(eeg, dtype=float)
-
-            filtered = bandpass_zero_phase(
-                eeg,
-                fs=eeg_fs,
-                low_hz=lower_hz,
-                high_hz=upper_hz,
-                order=filter_order,
-            )
-
-            filtered_segments.append(filtered)
-
-    if not filtered_segments:
-        raise RuntimeError(
-            f"{subject_id}: no valid EEG segments available."
-        )
-
-    concatenated = np.concatenate(
-        filtered_segments,
-        axis=1,
-    )
-
-    W = envelope_connectivity(concatenated)
-    eigenvalues, U = graph_fourier_basis(W)
-
-    # ---------------------------------------------------------------
-    # Product feature extraction
-    # ---------------------------------------------------------------
-    feature_rows = []
-
-    for product in products:
-        eeg_segment_features = []
-
-        for record in product["eeg_segments"]:
-            eeg = record["data"]
-            if eeg is None:
-                continue
-
-            eeg = bandpass_zero_phase(
-                np.asarray(eeg, dtype=float),
-                fs=eeg_fs,
-                low_hz=lower_hz,
-                high_hz=upper_hz,
-                order=filter_order,
-            )
-
-            eeg_segment_features.append(
-                gft_power(eeg, U)
-            )
-
-        if eeg_segment_features:
-            eeg_features = aggregate_segment_features(
-                eeg_segment_features
-            )
-        else:
-            eeg_features = np.full(U.shape[1], np.nan)
-
-        et_segment_features = []
-        et_marketing_segment_features = []
-
-        for record in product["et_segments"]:
-            et = record["data"]
-            if et is None:
-                continue
-
-            et = np.asarray(et, dtype=float)
-
-            x, y = gaze_xy_from_et(et)
-            x, y = interpolate_internal_nans(x, y)
-
-            distance = accumulated_distance(x, y)
-
-            et_segment_features.append(
-                hjorth_features(distance)
-            )
-
-            et_marketing_segment_features.append(
-                et_marketing_features(
-                    et_segment=et,
-                    fs=et_fs,
-                    t1=t1,
-                    t2=t2,
-                    min_fixation_seconds=min_fixation_seconds,
-                )
-            )
-
-        if et_segment_features:
-            et_behavioral = aggregate_segment_features(
-                et_segment_features
-            )
-            et_marketing = aggregate_segment_features(
-                et_marketing_segment_features
-            )
-        else:
-            et_behavioral = np.full(3, np.nan)
-            et_marketing = np.full(4, np.nan)
-
-        feature_vector = np.concatenate(
-            [
-                eeg_features,
-                et_behavioral,
-                et_marketing,
-            ]
-        )
-
-        feature_rows.append({
-            "subject_id": subject_id,
-            "page": product["page"],
-            "product": product["product"],
-            "label": product["label"],
-            "label_name": product["label_name"],
-            "eeg_gft": eeg_features,
-            "et_behavioral": et_behavioral,
-            "et_marketing": et_marketing,
-            "feature_vector": feature_vector,
-        })
-
+from scipy.io import loadmat
+
+EXPECTED_EEG_CHANNELS = 19
+EXPECTED_ET_CHANNELS = 6
+EXPECTED_EEG_FS = 300.0
+EXPECTED_ET_FS = 120.0
+EXPECTED_PAGES = 6
+EXPECTED_PRODUCTS = 24
+MIN_SEGMENT_SECONDS = 0.5
+
+
+def mat_to_python(obj: Any) -> Any:
+    if hasattr(obj, "_fieldnames"):
+        return {k: mat_to_python(getattr(obj, k)) for k in obj._fieldnames}
+    if isinstance(obj, np.ndarray):
+        if obj.dtype.names is not None:
+            return [mat_to_python(x) for x in obj]
+        if obj.dtype == object:
+            if obj.ndim == 0:
+                return mat_to_python(obj.item())
+            return np.array(
+                [mat_to_python(x) for x in obj.flat], dtype=object
+            ).reshape(obj.shape)
+        return obj
+    if isinstance(obj, np.generic):
+        return obj.item()
+    return obj
+
+
+def load_subject(path: Path) -> Dict[str, Any]:
+    raw = loadmat(str(path), squeeze_me=True, struct_as_record=False)
     return {
-        "subject_id": subject_id,
-        "sampling_rates": {
-            "eeg_hz": eeg_fs,
-            "et_hz": et_fs,
-        },
-        "graph": {
-            "W": W,
-            "eigenvalues": eigenvalues,
-            "U": U,
-            "construction_scope": (
-                "subject-level; all retained EEG segments"
-            ),
-        },
-        "features": feature_rows,
+        k: mat_to_python(v)
+        for k, v in raw.items()
+        if not k.startswith("__")
     }
 
 
-def build_csv_rows(subject_results: List[Dict]) -> Tuple[List[str], List[List]]:
-    columns = (
-        ["subject_id", "page", "product", "label", "label_name"]
-        + [f"gft_{i+1:02d}" for i in range(19)]
-        + ["hjorth_activity", "hjorth_mobility", "hjorth_complexity"]
-        + [
-            "fixation_count",
-            "mean_fixation_duration",
-            "time_to_first_fixation",
-            "dwell_time",
-        ]
-    )
-
-    rows = []
-
-    for subject in subject_results:
-        for item in subject["features"]:
-            eeg = item["eeg_gft"]
-            beh = item["et_behavioral"]
-            marketing = item["et_marketing"]
-
-            row = [
-                item["subject_id"],
-                item["page"],
-                item["product"],
-                item["label"],
-                item["label_name"],
-            ]
-
-            row.extend(eeg.tolist())
-            row.extend(beh.tolist())
-            row.extend(marketing.tolist())
-
-            rows.append(row)
-
-    return columns, rows
+def unwrap(value: Any) -> Any:
+    while isinstance(value, np.ndarray) and value.size == 1:
+        value = value.reshape(-1)[0]
+    return value
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Stage 2: GFT EEG + gaze-dynamics/ET feature extraction "
-            "for the Kalaganis et al. pipeline."
+def field(obj: Any, name: str) -> Any:
+    obj = unwrap(obj)
+    if isinstance(obj, dict) and name in obj:
+        return obj[name]
+    raise KeyError(f"Missing field '{name}'")
+
+
+def nested_field(obj: Any, *names: str) -> Any:
+    for name in names:
+        obj = field(obj, name)
+    return obj
+
+
+def scalar(value: Any, name: str) -> float:
+    value = unwrap(value)
+    arr = np.asarray(value)
+    if arr.size != 1:
+        raise ValueError(f"{name} is not scalar: shape={arr.shape}")
+    return float(arr.reshape(-1)[0])
+
+
+def labels_from_chans(chans: Any) -> Optional[List[str]]:
+    """
+    Extract channel labels from the actual MATLAB chan metadata.
+    Returns None only if the representation cannot be interpreted safely.
+    """
+    chans = unwrap(chans)
+
+    def as_string(x: Any) -> str:
+        x = unwrap(x)
+        if isinstance(x, bytes):
+            return x.decode(errors="ignore").strip()
+        if isinstance(x, str):
+            return x.strip()
+        if isinstance(x, np.ndarray):
+            if x.dtype.kind in {"U", "S"}:
+                if x.ndim == 0:
+                    return str(x.item()).strip()
+                return "".join(str(v) for v in x.flat).strip()
+            if x.size == 1:
+                return as_string(x.reshape(-1)[0])
+        return str(x).strip()
+
+    if isinstance(chans, dict):
+        if "labels" in chans:
+            return labels_from_chans(chans["labels"])
+        return None
+
+    if isinstance(chans, (list, tuple)):
+        out = []
+        for x in chans:
+            if isinstance(x, dict) and "labels" in x:
+                x = x["labels"]
+            out.append(as_string(x))
+        return out if out else None
+
+    if isinstance(chans, np.ndarray):
+        if chans.dtype == object:
+            out = []
+            for x in chans.flat:
+                if isinstance(x, dict) and "labels" in x:
+                    x = x["labels"]
+                out.append(as_string(x))
+            return out if out else None
+        if chans.dtype.kind in {"U", "S"}:
+            # Character arrays can represent one label or a character matrix.
+            if chans.ndim == 0:
+                return [as_string(chans)]
+            if chans.ndim == 1:
+                return [as_string(x) for x in chans]
+            return ["".join(str(x) for x in row).strip()
+                    for row in chans]
+    return None
+
+
+def segment_pairs(value: Any, name: str) -> np.ndarray:
+    arr = np.asarray(value, dtype=float)
+    if arr.size == 0:
+        return np.empty((0, 2), dtype=int)
+    if arr.ndim == 1:
+        if arr.size != 2:
+            raise ValueError(f"{name}: expected [start,end]")
+        arr = arr.reshape(1, 2)
+    if arr.ndim != 2 or arr.shape[1] != 2:
+        raise ValueError(f"{name}: unexpected shape {arr.shape}")
+    return arr.astype(int)
+
+
+def extract_segment(data: np.ndarray, start: int, end: int,
+                    name: str) -> np.ndarray:
+    if start < 1 or end < start:
+        raise ValueError(f"{name}: invalid MATLAB interval [{start},{end}]")
+    if end > data.shape[1]:
+        raise ValueError(
+            f"{name}: end={end} exceeds data length={data.shape[1]}"
         )
-    )
+    # MATLAB start:end is inclusive.
+    # Python equivalent is [start-1:end].
+    return np.asarray(data[:, start - 1:end], dtype=np.float64)
 
-    parser.add_argument(
-        "--input",
-        required=True,
-        type=Path,
-        help="stage1_dataset.pkl",
-    )
 
-    parser.add_argument(
-        "--output-dir",
-        required=True,
-        type=Path,
-        help="Output directory.",
-    )
+def prepare_subject(path: Path) -> Dict[str, Any]:
+    root = load_subject(path)
+    subject = root.get(path.stem)
+    if subject is None:
+        # Fallback only if there is exactly one non-meta variable.
+        vals = list(root.values())
+        if len(vals) != 1:
+            raise ValueError(f"Could not identify subject struct in {path}")
+        subject = vals[0]
 
-    parser.add_argument(
-        "--lower-hz",
-        type=float,
-        default=DEFAULT_LOWER_HZ,
-    )
+    eeg = field(subject, "EEG_clean")
+    et = field(subject, "ET_clean")
 
-    parser.add_argument(
-        "--upper-hz",
-        type=float,
-        default=DEFAULT_UPPER_HZ,
-    )
+    eeg_data = np.asarray(field(eeg, "Data"), dtype=float)
+    et_data = np.asarray(field(et, "Data"), dtype=float)
+    eeg_fs = scalar(field(eeg, "Fs"), "EEG Fs")
+    et_fs = scalar(field(et, "Fs"), "ET Fs")
 
-    parser.add_argument(
-        "--filter-order",
-        type=int,
-        default=DEFAULT_FILTER_ORDER,
-    )
+    if eeg_data.ndim != 2:
+        raise ValueError(f"{path.name}: EEG Data must be [channels,samples]")
+    if et_data.ndim != 2:
+        raise ValueError(f"{path.name}: ET Data must be [channels,samples]")
 
-    parser.add_argument(
-        "--t1",
-        type=float,
-        default=DEFAULT_T1,
-        help=(
-            "EyeMMV first spatial threshold in normalized tracker "
-            "coordinates. Operationalization; not explicitly stated "
-            "by the Kalaganis paper."
-        ),
-    )
+    if eeg_data.shape[0] != EXPECTED_EEG_CHANNELS:
+        raise ValueError(
+            f"{path.name}: expected 19 EEG channels, found "
+            f"{eeg_data.shape[0]}"
+        )
+    if et_data.shape[0] != EXPECTED_ET_CHANNELS:
+        raise ValueError(
+            f"{path.name}: expected 6 ET channels, found "
+            f"{et_data.shape[0]}"
+        )
+    if not np.isclose(eeg_fs, EXPECTED_EEG_FS):
+        raise ValueError(f"{path.name}: unexpected EEG Fs={eeg_fs}")
+    if not np.isclose(et_fs, EXPECTED_ET_FS):
+        raise ValueError(f"{path.name}: unexpected ET Fs={et_fs}")
 
-    parser.add_argument(
-        "--t2",
-        type=float,
-        default=DEFAULT_T2,
-        help=(
-            "EyeMMV second spatial threshold in normalized tracker "
-            "coordinates. Operationalization; not explicitly stated "
-            "by the Kalaganis paper."
-        ),
-    )
+    try:
+        channel_names = labels_from_chans(field(eeg, "chans"))
+    except KeyError:
+        channel_names = None
 
-    parser.add_argument(
-        "--min-fixation-seconds",
-        type=float,
-        default=DEFAULT_MIN_FIXATION_SECONDS,
-        help=(
-            "Minimum fixation duration. EyeMMV reference operationalization "
-            "uses 150 ms; exact value is not explicitly stated by "
-            "the Kalaganis paper."
-        ),
-    )
+    if channel_names is None or len(channel_names) != EXPECTED_EEG_CHANNELS:
+        raise ValueError(
+            f"{path.name}: could not safely recover all 19 EEG channel labels."
+        )
 
+    products = []
+    counts = {
+        "products_total": 0,
+        "products_with_eeg": 0,
+        "products_with_et": 0,
+        "products_with_both": 0,
+        "eeg_segments_total": 0,
+        "eeg_segments_kept": 0,
+        "et_segments_total": 0,
+        "et_segments_kept": 0,
+    }
+
+    for page_no in range(1, EXPECTED_PAGES + 1):
+        page = field(subject, f"Page{page_no}")
+
+        for product_no in range(1, EXPECTED_PRODUCTS + 1):
+            product = field(page, f"Product{product_no}")
+            counts["products_total"] += 1
+
+            bought = scalar(
+                nested_field(product, "ProductInfo", "Bought"),
+                "ProductInfo.Bought"
+            )
+            if bought not in (0.0, 1.0):
+                raise ValueError(
+                    f"{path.name} Page{page_no} Product{product_no}: "
+                    f"Bought={bought}, expected 0/1"
+                )
+
+            eeg_idx = segment_pairs(
+                field(product, "EEG_segments"),
+                f"{path.name} Page{page_no} Product{product_no} EEG_segments"
+            )
+            et_idx = segment_pairs(
+                field(product, "ET_segments"),
+                f"{path.name} Page{page_no} Product{product_no} ET_segments"
+            )
+
+            counts["eeg_segments_total"] += len(eeg_idx)
+            counts["et_segments_total"] += len(et_idx)
+
+            eeg_segments = []
+            for start, end in eeg_idx:
+                duration = (end - start + 1) / eeg_fs
+                if duration < MIN_SEGMENT_SECONDS:
+                    continue
+                eeg_segments.append({
+                    "start_matlab": int(start),
+                    "end_matlab": int(end),
+                    "start_python": int(start - 1),
+                    "end_python_exclusive": int(end),
+                    "duration_seconds": float(duration),
+                    "data": extract_segment(
+                        eeg_data, start, end,
+                        f"{path.name} EEG"
+                    ),
+                })
+                counts["eeg_segments_kept"] += 1
+
+            et_segments = []
+            for start, end in et_idx:
+                duration = (end - start + 1) / et_fs
+                if duration < MIN_SEGMENT_SECONDS:
+                    continue
+                et_segments.append({
+                    "start_matlab": int(start),
+                    "end_matlab": int(end),
+                    "start_python": int(start - 1),
+                    "end_python_exclusive": int(end),
+                    "duration_seconds": float(duration),
+                    "data": extract_segment(
+                        et_data, start, end,
+                        f"{path.name} ET"
+                    ),
+                })
+                counts["et_segments_kept"] += 1
+
+            if eeg_segments:
+                counts["products_with_eeg"] += 1
+            if et_segments:
+                counts["products_with_et"] += 1
+            if eeg_segments and et_segments:
+                counts["products_with_both"] += 1
+
+            products.append({
+                "page": page_no,
+                "product": product_no,
+                "label": int(bought),
+                "eeg_segments": eeg_segments,
+                "et_segments": et_segments,
+            })
+
+    return {
+        "subject_id": path.stem,
+        "source_file": str(path.resolve()),
+        "eeg_fs": eeg_fs,
+        "et_fs": et_fs,
+        "eeg_channel_names": channel_names,
+        "eeg_n_channels": int(eeg_data.shape[0]),
+        "et_n_channels": int(et_data.shape[0]),
+        "products": products,
+        "counts": counts,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", required=True, type=Path)
+    parser.add_argument("--output-dir", required=True, type=Path)
     args = parser.parse_args()
 
-    if not args.input.exists():
-        raise FileNotFoundError(args.input)
+    subject_files = sorted(
+        [
+            p for p in args.data_dir.glob("S*.mat")
+            if re.fullmatch(r"S\d+\.mat", p.name, flags=re.I)
+        ],
+        key=lambda p: int(re.search(r"\d+", p.stem).group())
+    )
+    if not subject_files:
+        raise FileNotFoundError(f"No S*.mat files found in {args.data_dir}")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    stage1 = load_pickle(args.input)
+    subjects = []
+    for path in subject_files:
+        print(f"Preparing {path.name}")
+        subjects.append(prepare_subject(path))
 
-    if stage1.get("stage") != "1_dataset_epoch_preparation":
-        raise ValueError(
-            "Input does not appear to be the expected Stage 1 output."
-        )
-
-    subject_results = []
-
-    for idx, subject in enumerate(stage1["subjects"], start=1):
-        print(
-            f"[{idx}/{len(stage1['subjects'])}] "
-            f"Extracting features for {subject['subject_id']}..."
-        )
-
-        result = process_subject(
-            subject=subject,
-            lower_hz=args.lower_hz,
-            upper_hz=args.upper_hz,
-            filter_order=args.filter_order,
-            t1=args.t1,
-            t2=args.t2,
-            min_fixation_seconds=args.min_fixation_seconds,
-        )
-
-        subject_results.append(result)
-
-    feature_dataset = {
-        "stage": "2_signal_processing_feature_construction",
-        "paper": stage1["paper"],
-        "config": {
-            "eeg_bandpass_hz": [
-                args.lower_hz,
-                args.upper_hz,
-            ],
-            "eeg_filter_order": args.filter_order,
-            "eeg_filter_phase": "zero_phase",
-            "graph_connectivity": (
-                "absolute Pearson correlation of Hilbert envelopes"
-            ),
-            "graph_laplacian": "D-W",
-            "gft_power": "mean(abs(U.T @ X)**2, axis=time)",
-            "et_behavioral": [
-                "Hjorth Activity",
-                "Hjorth Mobility",
-                "Hjorth Complexity",
-            ],
-            "et_fixation_method": (
-                "EyeMMV-style two-step spatial-dispersion "
-                "operationalization"
-            ),
-            "eyemmv_t1": args.t1,
-            "eyemmv_t2": args.t2,
-            "eyemmv_min_fixation_seconds":
-                args.min_fixation_seconds,
-            "blink_rate": (
-                "not computed: no explicit blink event channel "
-                "is supplied by the documented preprocessed ET structure"
-            ),
-            "normalization": (
-                "not performed; exact normalization is not disclosed "
-                "sufficiently by the paper and belongs before CV training"
-            ),
-            "graph_scope": (
-                "subject-level using all retained EEG segments; "
-                "must be revisited for leakage-safe CV"
-            ),
+    artifact = {
+        "stage": 1,
+        "subjects": subjects,
+        "dataset_constants": {
+            "eeg_fs": EXPECTED_EEG_FS,
+            "et_fs": EXPECTED_ET_FS,
+            "eeg_channels": EXPECTED_EEG_CHANNELS,
+            "et_channels": EXPECTED_ET_CHANNELS,
+            "min_segment_seconds": MIN_SEGMENT_SECONDS,
         },
-        "subjects": subject_results,
+        "dataset_provided_preprocessing": {
+            "eeg": "0.5-45 Hz 3rd-order zero-phase Butterworth + ASR + FORCe",
+            "et": "blink-related missing samples linearly interpolated",
+        },
+        "stage1_operations": [
+            "load actual subject .mat files",
+            "verify 19 EEG / 6 ET channels",
+            "convert MATLAB inclusive segment indices",
+            "discard segments shorter than 0.5 s",
+            "preserve channel metadata",
+        ],
     }
 
-    pkl_path = args.output_dir / "stage2_features.pkl"
-    graph_path = args.output_dir / "stage2_graphs.pkl"
-    csv_path = args.output_dir / "stage2_features.csv"
+    output = args.output_dir / "stage1_dataset.pkl"
+    with output.open("wb") as f:
+        pickle.dump(artifact, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    save_pickle(pkl_path, feature_dataset)
-
-    graphs = {
-        s["subject_id"]: s["graph"]
-        for s in subject_results
-    }
-    save_pickle(graph_path, graphs)
-
-    columns, rows = build_csv_rows(subject_results)
-
-    import csv
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(columns)
-        writer.writerows(rows)
-
-    print("\nStage 2 complete.")
-    print(f"Feature dataset : {pkl_path}")
-    print(f"Graphs          : {graph_path}")
-    print(f"CSV             : {csv_path}")
-    print(
-        "\nNOTE: This is a feature-construction stage. "
-        "No CV, feature selection, normalization, SVM, or evaluation "
-        "has been performed."
-    )
+    print(f"\nWrote {output}")
 
 
 if __name__ == "__main__":
